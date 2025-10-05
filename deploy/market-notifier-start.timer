@@ -1,1 +1,9 @@
+[Unit]
+Description=Timer to start Market Notifier at 09:00 IST on weekdays (GCE)
 
+[Timer]
+OnCalendar=Mon..Fri 09:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
