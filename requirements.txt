@@ -1,0 +1,12 @@
+aiohttp
+yfinance
+pytz
+requests
+beautifulsoup4
+feedparser
+vaderSentiment
+lightgbm
+scikit-learn
+joblib
+pandas
+numpy
