@@ -1,44 +1,30 @@
+#!/usr/bin/env python3
 """
 sentiment_analyzer.py
-
-Simple sentiment using NLTK's VADER lexicon. Returns:
-    {"compound": float, "label": "positive"/"neutral"/"negative"}
-
-Dependencies:
-    pip install nltk
-    python -m nltk.downloader vader_lexicon
+Compute VADER sentiment scores for headlines.
+Returns: {"mean_compound": float, "items":[{"title","url","compound","pos","neu","neg"}]}
 """
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-from typing import Dict
-import logging
+_analyzer = SentimentIntensityAnalyzer()
 
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-
-# create singleton analyzer
-_analyzer = None
-def _get_analyzer():
-    global _analyzer
-    if _analyzer is None:
-        _analyzer = SentimentIntensityAnalyzer()
-    return _analyzer
-
-def sentiment_score_text(text: str) -> Dict:
-    """
-    Returns a dict with compound score and label.
-    """
-    if not text:
-        return {"compound": 0.0, "label": "neutral"}
-    try:
-        sid = _get_analyzer()
-        scores = sid.polarity_scores(text)
-        compound = float(scores["compound"])
-        if compound >= 0.05:
-            label = "positive"
-        elif compound <= -0.05:
-            label = "negative"
-        else:
-            label = "neutral"
-        return {"compound": compound, "label": label}
-    except Exception:
-        logging.exception("Sentiment analysis failed.")
-        return {"compound": 0.0, "label": "neutral"}
+def analyze_texts(headlines):
+    if not headlines:
+        return {"mean_compound": 0.0, "items": []}
+    items = []
+    total = 0.0
+    for h in headlines:
+        text = (h.get("title") or "") + " " + (h.get("summary") or "")
+        vs = _analyzer.polarity_scores(text)
+        compound = vs["compound"]
+        items.append({
+            "title": h.get("title"),
+            "url": h.get("url"),
+            "compound": compound,
+            "pos": vs["pos"],
+            "neu": vs["neu"],
+            "neg": vs["neg"]
+        })
+        total += compound
+    mean = round(total / len(items), 4) if items else 0.0
+    return {"mean_compound": mean, "items": items}
