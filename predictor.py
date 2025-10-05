@@ -1,116 +1,143 @@
+#!/usr/bin/env python3
 """
 predictor.py
+Production predictor:
+- if trained LightGBM models exist in models/, uses them for inference (probability + expected additional %)
+- otherwise falls back to a deterministic heuristic predictor
 
-- create_features_from_df(df): produces feature DataFrame (MA, RSI, returns etc.)
-- train_model(csv_path, model_out_path): train RandomForestClassifier and save model+scaler.
-- load_model_and_scaler(path): returns model, scaler
-- predict_from_model(model, scaler, features_df): returns predicted class array for rows
-
-Expect CSV or yfinance DataFrame with columns: Open, High, Low, Close, Volume (datetime index).
-
-Dependencies:
-    pip install scikit-learn pandas numpy ta joblib
+predict(...) signature:
+    predict(nifty_pct, vix=None, news_sentiment=0.0, recent_volatility=None, recent_market_df=None)
+returns dict:
+    { "probability": float(0..1), "expected_additional_pct": float, "confidence": float(0..1), "explanation": {...} }
 """
 
-import pandas as pd
+import os
+import json
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-import joblib
-import logging
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ema_up = up.ewm(com=(period - 1), adjust=False).mean()
-    ema_down = down.ewm(com=(period - 1), adjust=False).mean()
-    rs = ema_up / (ema_down + 1e-9)
-    return 100 - (100 / (1 + rs))
+MODEL_DIR = "models"
+PROB_PATH = os.path.join(MODEL_DIR, "prob_model.pkl")
+REG_PATH = os.path.join(MODEL_DIR, "reg_model.pkl")
+FEATURES_PATH = os.path.join(MODEL_DIR, "feature_cols.json")
 
-def create_features_from_df(df: pd.DataFrame) -> pd.DataFrame:
+# lazy imports
+PROB_MODEL = None
+REG_MODEL = None
+FEATURE_COLS = None
+
+try:
+    import joblib
+    if os.path.exists(PROB_PATH) and os.path.exists(REG_PATH) and os.path.exists(FEATURES_PATH):
+        PROB_MODEL = joblib.load(PROB_PATH)
+        REG_MODEL = joblib.load(REG_PATH)
+        with open(FEATURES_PATH, "r") as f:
+            FEATURE_COLS = json.load(f)
+except Exception:
+    PROB_MODEL = None
+    REG_MODEL = None
+    FEATURE_COLS = None
+
+def heuristic_predict(nifty_pct, vix=None, news_sentiment=0.0, recent_volatility=None):
+    drop = min(0.0, nifty_pct)
+    mag = abs(drop)
+    base_prob = min(0.9, mag / 6.0)
+    vix_factor = 0.0
+    if vix is not None:
+        if vix > 30:
+            vix_factor = 0.25
+        elif vix > 25:
+            vix_factor = 0.18
+        elif vix > 20:
+            vix_factor = 0.12
+        elif vix > 15:
+            vix_factor = 0.04
+    sent_factor = 0.0
+    if news_sentiment < -0.3:
+        sent_factor = 0.20
+    elif news_sentiment < -0.1:
+        sent_factor = 0.10
+    elif news_sentiment > 0.1:
+        sent_factor = -0.05
+    vol_factor = 0.0
+    confidence = 0.7
+    if recent_volatility:
+        if recent_volatility > 1.2:
+            vol_factor = 0.12
+            confidence = 0.48
+        elif recent_volatility > 0.6:
+            vol_factor = 0.06
+            confidence = 0.58
+    prob = base_prob + vix_factor + sent_factor + vol_factor
+    prob = max(0.01, min(0.99, prob))
+    expected_additional = round(prob * max(0.5, mag * 0.5), 2)
+    if abs(news_sentiment) < 0.05:
+        confidence -= 0.1
+    confidence = max(0.2, min(0.95, confidence))
+    return {
+        "probability": round(prob, 3),
+        "expected_additional_pct": expected_additional,
+        "confidence": round(confidence, 3),
+        "explanation": {"method": "heuristic"}
+    }
+
+def _make_feature_row(recent_market_df):
     """
-    Input: DataFrame with columns Open, High, Low, Close, Volume
-    Output: DataFrame of features aligned with df.index (NaNs for first rows)
+    Make feature row from a pandas DataFrame of daily OHLC indexed by date.
+    Mirrors the trainer feature engineering.
     """
-    df = df.copy().sort_index()
-    close = df["Close"]
-    features = pd.DataFrame(index=df.index)
-    features["ret1"] = close.pct_change(1)
-    features["ret2"] = close.pct_change(2)
-    features["ma5"] = close.rolling(5).mean()
-    features["ma10"] = close.rolling(10).mean()
-    features["ma20"] = close.rolling(20).mean()
-    features["ma5_ma20_diff"] = features["ma5"] - features["ma20"]
-    features["vol_rolling"] = df["Volume"].rolling(10).mean()
-    features["rsi14"] = rsi(close, 14)
-    # add simple momentum
-    features["momentum_5"] = close - close.shift(5)
-    # fill NA where safe (we'll drop rows with any NA before training)
-    return features
+    import pandas as pd
+    df = recent_market_df.copy()
+    if df.empty:
+        raise ValueError("recent_market_df empty")
+    df = df.sort_index()
+    df['ret_1d'] = df['Close'].pct_change() * 100
+    for w in [1,3,5,10]:
+        df[f'ret_roll_mean_{w}'] = df['ret_1d'].rolling(window=w).mean()
+        df[f'ret_roll_std_{w}'] = df['ret_1d'].rolling(window=w).std()
+    df['mom_5d'] = df['Close'].pct_change(5) * 100
+    df['range_pct'] = (df['High'] - df['Low']) / df['Low'] * 100
+    df['open_to_close'] = (df['Close'] - df['Open']) / df['Open'] * 100
+    row = df.iloc[-1]
+    feat = []
+    for c in FEATURE_COLS:
+        feat.append(row.get(c, 0.0) if c in row.index else 0.0)
+    return np.array(feat).reshape(1, -1)
 
-def generate_labels(df: pd.DataFrame, horizon: int = 1) -> pd.Series:
-    """
-    Binary label: 1 if future close after 'horizon' days > today close else 0
-    """
-    future = df["Close"].shift(-horizon)
-    labels = (future > df["Close"]).astype(int)
-    return labels
-
-def train_model(csv_path: str, model_out_path: str = "model.joblib"):
-    """
-    csv_path: csv with DateTime index and OHLCV columns. If multiple symbols present, supply only one.
-    """
-    df = pd.read_csv(csv_path, parse_dates=True, index_col=0)
-    features = create_features_from_df(df)
-    labels = generate_labels(df, horizon=1)
-
-    data = pd.concat([features, labels.rename("label")], axis=1).dropna()
-    X = data.drop(columns=["label"])
-    y = data["label"]
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-
-    scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_test_s = scaler.transform(X_test)
-
-    model = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
-    model.fit(X_train_s, y_train)
-
-    preds = model.predict(X_test_s)
-    logging.info("Train complete. Test classification report:\n%s", classification_report(y_test, preds))
-
-    # Save both model and scaler
-    joblib.dump({"model": model, "scaler": scaler}, model_out_path)
-    logging.info("Saved model to %s", model_out_path)
-    return model_out_path
-
-def load_model_and_scaler(path: str = "model.joblib"):
-    d = joblib.load(path)
-    return d["model"], d["scaler"]
-
-def predict_from_model(model, scaler, features_df: pd.DataFrame):
-    """
-    features_df: output of create_features_from_df; returns predicted class array aligned to index
-    """
-    X = features_df.dropna()
-    if X.empty:
-        return np.array([])
-    Xs = scaler.transform(X.values)
-    preds = model.predict(Xs)
-    # align to index
-    return pd.Series(preds, index=X.index)
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train-csv", help="OHLCV CSV to train on (index as date)", required=False)
-    parser.add_argument("--out", help="output model path", default="model.joblib")
-    args = parser.parse_args()
-    if args.train_csv:
-        train_model(args.train_csv, args.out)
-    else:
-        print("Run with --train-csv <file.csv> to train a model.")
+def predict(nifty_pct, vix=None, news_sentiment=0.0, recent_volatility=None, recent_market_df=None):
+    # If models available and we have a recent_market_df, use them
+    if PROB_MODEL and REG_MODEL and FEATURE_COLS and recent_market_df is not None:
+        try:
+            Xrow = _make_feature_row(recent_market_df)
+            # LightGBM predict returns probability if trained as classifier with predict; handle both
+            prob = None
+            try:
+                prob = float(PROB_MODEL.predict(Xrow)[0])
+            except Exception:
+                try:
+                    prob = float(PROB_MODEL.predict_proba(Xrow)[:, 1][0])
+                except Exception:
+                    prob = None
+            if prob is None:
+                raise RuntimeError("Model predict returned None")
+            prob = max(0.0, min(1.0, prob))
+            expected_add = float(REG_MODEL.predict(Xrow)[0])
+            confidence = max(0.2, min(0.99, abs(prob - 0.5) * 2))
+            top_features = {}
+            try:
+                fi = PROB_MODEL.feature_importance(importance_type="gain")
+                if len(fi) == len(FEATURE_COLS):
+                    idx_sorted = list(reversed(fi.argsort()[-5:]))
+                    top_features = {FEATURE_COLS[i]: int(fi[i]) for i in idx_sorted}
+            except Exception:
+                top_features = {}
+            return {
+                "probability": round(prob, 3),
+                "expected_additional_pct": round(max(0.0, expected_add), 3),
+                "confidence": round(confidence, 3),
+                "explanation": {"method": "model", "top_features": top_features}
+            }
+        except Exception:
+            # graceful fallback to heuristic
+            return {**heuristic_predict(nifty_pct, vix, news_sentiment, recent_volatility), "explanation": {"method": "fallback"}}
+    # fallback
+    return heuristic_predict(nifty_pct, vix, news_sentiment, recent_volatility)
