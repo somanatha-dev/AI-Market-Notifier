@@ -1,1 +1,11 @@
+[Unit]
+Description=Stop Market Notifier Docker container (GCE)
+After=network.target docker.service
+Requires=docker.service
 
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/market-notifier
+ExecStart=/opt/market-notifier/stop.sh
+TimeoutStartSec=300
+RemainAfterExit=yes
